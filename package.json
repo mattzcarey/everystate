@@ -1,6 +1,6 @@
 {
   "name": "everystate",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A TLA+ model checker with no Java dependency (TLC-compatible). Prebuilt native binaries, with a WebAssembly build for use from JavaScript.",
   "type": "module",
   "license": "MIT",
