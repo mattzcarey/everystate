@@ -95,6 +95,44 @@ Sym == Permutations(Procs)
   assert.deepEqual([sym.result.generated, sym.result.distinct], [19, 7]);
 });
 
+test('a function from strings prints as a record only when every key is a name', () => {
+  const spec = `---- MODULE K ----
+EXTENDS TLC
+F(S) == [k \\in S |-> 1]
+VARIABLES digits, under, fair, space, empty, merged, nested, sf, keyword, exponent, accent
+Init == /\\ digits = F({"72", "dup:72"})
+        /\\ under = F({"a", "_"})
+        /\\ fair = F({"a", "WF_x"})
+        /\\ space = F({"a", "a b"})
+        /\\ empty = F({"a", ""})
+        /\\ merged = [a |-> 1] @@ ("72" :> 1)
+        /\\ nested = [r \\in {"a", "b"} |-> F({"c", "d:e"})]
+        /\\ sf = F({"a", "SF_"})
+        /\\ keyword = F({"a", "IF"})
+        /\\ exponent = F({"a", "1e5"})
+        /\\ accent = F({"a", "é"})
+Next == UNCHANGED <<digits, under, fair, space, empty, merged, nested, sf, keyword, exponent, accent>>
+Shown == digits = <<>>
+====`;
+  const { result, model } = check({ root: 'K', modules: { K: spec }, config: 'INIT Init\nNEXT Next\nINVARIANT Shown' });
+  // as printed by TLC 2.19 and 1.8.0
+  const want: Record<string, string> = {
+    digits: '("72" :> 1 @@ "dup:72" :> 1)',
+    under: '("a" :> 1 @@ "_" :> 1)',
+    fair: '("a" :> 1 @@ "WF_x" :> 1)',
+    space: '("a" :> 1 @@ "a b" :> 1)',
+    empty: '("a" :> 1 @@ "" :> 1)',
+    merged: '("a" :> 1 @@ "72" :> 1)',
+    nested: '[a |-> ("c" :> 1 @@ "d:e" :> 1), b |-> ("c" :> 1 @@ "d:e" :> 1)]',
+    sf: '[a |-> 1, SF_ |-> 1]',
+    keyword: '[a |-> 1, IF |-> 1]',
+    exponent: '[a |-> 1, 1e5 |-> 1]',
+    accent: '[a |-> 1, é |-> 1]',
+  };
+  const state = result.trace![0].state;
+  for (const [name, text] of Object.entries(want)) assert.equal(state[model.vars.findIndex(v => v.name === name)], text, name);
+});
+
 test('errors: unknown operator and missing constant', () => {
   assert.throws(() => check({ root: 'E', modules: { E: '---- MODULE E ----\nVARIABLE x\nInit == x = Foo\nNext == x\' = x\n====' }, config: 'INIT Init\nNEXT Next' }), /Unknown operator/);
   assert.throws(() => check({ root: 'E', modules: { E: '---- MODULE E ----\nCONSTANT C\nVARIABLE x\nInit == x = C\nNext == x\' = x\n====' }, config: 'INIT Init\nNEXT Next' }), /not assigned a value/);

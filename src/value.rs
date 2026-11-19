@@ -1240,8 +1240,12 @@ fn fmt_str(s: &str, o: &mut String) {
     }
     o.push('"');
 }
-fn is_ident(s: &str) -> bool {
-    s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') && s.bytes().any(|c| c.is_ascii_alphabetic())
+/// TLC's test for a field name it prints in a record (`isName`): letters, digits and `_` with at least
+/// one letter (Unicode, as Java's `Character.isLetterOrDigit`), and not a fairness name such as `WF_x`.
+fn is_name(s: &str) -> bool {
+    s.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && s.chars().any(char::is_alphabetic)
+        && !(s.len() > 3 && (s.starts_with("WF_") || s.starts_with("SF_")))
 }
 
 thread_local! {
@@ -1371,21 +1375,23 @@ pub fn fmt_into(v: &Value, o: &mut String) {
             o.push_str(">>");
         }
         Value::Record(r) => {
-            o.push('[');
-            for i in 0..r.names.len() {
+            let names: Vec<_> = r.names.iter().map(|&n| str_of(n)).collect();
+            // TLC prints a function from strings as a record only when every key is a name.
+            let rcd = names.iter().all(|n| is_name(n));
+            o.push(if rcd { '[' } else { '(' });
+            for (i, n) in names.iter().enumerate() {
                 if i > 0 {
-                    o.push_str(", ");
+                    o.push_str(if rcd { ", " } else { " @@ " });
                 }
-                let n = str_of(r.names[i]);
-                if is_ident(&n) {
-                    o.push_str(&n);
+                if rcd {
+                    o.push_str(n);
                 } else {
-                    fmt_str(&n, o);
+                    fmt_str(n, o);
                 }
-                o.push_str(" |-> ");
+                o.push_str(if rcd { " |-> " } else { " :> " });
                 fmt_into(&r.vals[i], o);
             }
-            o.push(']');
+            o.push(if rcd { ']' } else { ')' });
         }
         Value::Fcn(f) => {
             o.push('(');
