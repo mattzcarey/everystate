@@ -1073,7 +1073,8 @@ impl Evaluator {
                 check_stack()?;
                 let (s0, p0) = (self.st_touch.get(), self.pr_touch.get());
                 let v = self.eval(body, &None)?;
-                if self.st_touch.get() == s0 && self.pr_touch.get() == p0 {
+                // A lazy set can capture the state before its predicate reads any variables.
+                if self.st_touch.get() == s0 && self.pr_touch.get() == p0 && crate::modules::def_level(def) == 0 {
                     *def.cache.borrow_mut() = Some(v.clone());
                 }
                 return Ok(v);

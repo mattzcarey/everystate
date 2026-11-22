@@ -39,6 +39,21 @@ test('DieHard: full state space without the puzzle invariant', () => {
   assert.deepEqual([result.generated, result.distinct, result.queue], [97, 16, 0]);
 });
 
+test('a named lazy filter uses the current state inside Print', () => {
+  const spec = String.raw`---- MODULE Filter ----
+EXTENDS TLC
+VARIABLE b
+R == {k \in {0} \X {0} : b}
+Init == b = FALSE
+Next == b' = TRUE
+Inv == Print(0, R = {})
+====`;
+  const { result } = check({ root: 'Filter', modules: { Filter: spec }, config: 'INIT Init\nNEXT Next\nINVARIANT Inv' });
+  assert.equal(result.status, 'invariant');
+  assert.equal(result.name, 'Inv');
+  assert.deepEqual(result.trace!.map(t => fmt(t.state[0])), ['FALSE', 'TRUE']);
+});
+
 test('deadlock is reported unless disabled', () => {
   const spec = `---- MODULE D ----\nEXTENDS Naturals\nVARIABLE x\nInit == x = 0\nNext == x < 3 /\\ x' = x + 1\n====`;
   const cfg = 'INIT Init\nNEXT Next';
