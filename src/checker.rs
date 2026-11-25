@@ -313,6 +313,10 @@ pub struct Checker<'a> {
     pub parent: Vec<u32>,
     pub level: Vec<u32>,
     pub act: Vec<i32>,
+    /// For every state, its index among the successors of its parent (for an initial state, among the
+    /// states the initial predicate enumerates): the choice `rebuild` has to make again. Empty unless
+    /// `drop_states`.
+    pub(crate) ord: Vec<u32>,
     /// recorded graph: successor ids / actions per state (if record_graph)
     pub succ: Vec<Vec<u32>>,
     pub succ_act: Vec<Vec<u32>>,
@@ -348,6 +352,12 @@ pub struct Checker<'a> {
     /// ACTION_CONSTRAINT, VIEW, SYMMETRY, action property or recorded graph. EVERYSTATE_ENGINE=classic
     /// switches it off (every successor is then allocated before it is looked up).
     flat: bool,
+    /// A state's values are dropped once its successors have been generated; only its fingerprint (`fps`),
+    /// its parent, its level and its `ord` are kept, and `state_at` rebuilds the values from the initial
+    /// states when a trace needs them (see `rebuild`). True in flat mode with one worker, where nothing
+    /// but the search itself reads the values of a state it has finished with; `EVERYSTATE_RETAIN=all`
+    /// turns it off.
+    drop_states: bool,
     /// EVERYSTATE_EVAL=compiled: the compiled actions and invariants (see compile.rs)
     plans: Option<crate::compile::Plans>,
 }
@@ -360,10 +370,26 @@ pub fn classic_engine() -> bool {
     matches!(std::env::var("EVERYSTATE_ENGINE").as_deref(), Ok("classic"))
 }
 
+/// EVERYSTATE_RETAIN=all keeps the values of every state (for differential testing, and for a
+/// specification whose evaluation cannot be repeated: see `Checker::rebuild`).
+pub fn retain_all() -> bool {
+    matches!(std::env::var("EVERYSTATE_RETAIN").as_deref(), Ok("all"))
+}
+
 impl<'a> Checker<'a> {
     pub fn new(model: &'a Model, opts: CheckOptions) -> Checker<'a> {
         let ev = model.ev;
         let opts_record = opts.record_graph;
+        let flat = !classic_engine()
+            && !opts_record
+            && model.constraints.is_empty()
+            && model.action_constraints.is_empty()
+            && model.implied_actions.is_empty()
+            && model.view.is_none()
+            && model.symmetry.is_none();
+        // The parallel search keeps the states of a level in serialized form and rebuilds them with
+        // `Par::load` (`par.rs`), so it is left out of the retention change.
+        let sequential = opts.par.as_ref().map_or(true, |c| c.workers <= 1);
         ev.steps.enabled.set(std::env::var_os("EVERYSTATE_CACHE_STATS").is_some_and(|v| !v.is_empty() && v != "0"));
         ev.stats.active.set(true);
         ev.stats.check_deadlock.set(opts.check_deadlock);
@@ -409,6 +435,7 @@ impl<'a> Checker<'a> {
             parent: vec![],
             level: vec![],
             act: vec![],
+            ord: vec![],
             succ: vec![],
             succ_act: vec![],
             succ_state: None,
@@ -437,13 +464,12 @@ impl<'a> Checker<'a> {
             cur_level: 0,
             empty: StateData::blank(0),
             plans: if crate::compile::enabled() { Some(crate::compile::compile(model)) } else { None },
-            flat: !classic_engine()
-                && !opts_record
-                && model.constraints.is_empty()
-                && model.action_constraints.is_empty()
-                && model.implied_actions.is_empty()
-                && model.view.is_none()
-                && model.symmetry.is_none(),
+            flat,
+            // Only the search itself reads the values of a state it has finished with, and only when
+            // nothing reads the state graph after the search: a dump and a liveness check keep every
+            // state (`record_graph`), and so does the parallel search, whose states exist as bytes
+            // (`par.rs`).
+            drop_states: sequential && !opts_record && !retain_all(),
             level_end: usize::MAX,
             last_progress: 0.0,
             t_start: 0.0,
@@ -452,16 +478,18 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// State `i`. The states found by the parallel search are kept serialized and rebuilt on demand.
-    pub fn state_at(&self, i: usize) -> StateRef {
+    /// State `i`. The states found by the parallel search are kept serialized and rebuilt on demand, and
+    /// so are the states whose values were dropped (see `drop_states`).
+    pub fn state_at(&self, i: usize) -> R<StateRef> {
         let s = &self.states[i];
-        #[cfg(not(target_arch = "wasm32"))]
         if Rc::ptr_eq(s, &self.empty) {
+            #[cfg(not(target_arch = "wasm32"))]
             if let Some(p) = &self.par {
-                return p.load(i, self.nvars);
+                return Ok(p.load(i, self.nvars));
             }
+            return self.rebuild(i);
         }
-        s.clone()
+        Ok(s.clone())
     }
 
     pub(crate) fn sync_stats(&self) {
@@ -649,24 +677,117 @@ impl<'a> Checker<'a> {
         Some(Outdegree { min: d[0], avg, p95: d[p], max: d[d.len() - 1] })
     }
 
-    pub fn trace_to(&self, id: usize) -> Vec<TraceStep> {
+    /// The trace to `id`. `Err` is the result to report in its place: a state the trace passes through
+    /// can no longer be rebuilt (see `rebuild`).
+    pub fn trace_to(&self, id: usize) -> Result<Vec<TraceStep>, CheckResult> {
         let mut out = vec![];
         let mut i = id as u32;
         loop {
             let a = self.act[i as usize];
-            out.push(TraceStep { state: self.state_at(i as usize), action: if a >= 0 { Some(a as usize) } else { None }, id: i as i64 });
+            let state = match self.state_at(i as usize) {
+                Ok(s) => s,
+                Err(e) => return Err(self.error(self.describe_err(&e, false), None)),
+            };
+            out.push(TraceStep { state, action: if a >= 0 { Some(a as usize) } else { None }, id: i as i64 });
             i = self.parent[i as usize];
             if i == NO_PARENT {
                 break;
             }
         }
         out.reverse();
-        out
+        Ok(out)
     }
-    fn trace_plus(&self, sid: usize, t: &StateRef, a: usize, id: i64) -> Vec<TraceStep> {
-        let mut tr = self.trace_to(sid);
+    fn trace_plus(&self, sid: usize, t: &StateRef, a: usize, id: i64) -> Result<Vec<TraceStep>, CheckResult> {
+        let mut tr = self.trace_to(sid)?;
         tr.push(TraceStep { state: t.clone(), action: Some(a), id });
-        tr
+        Ok(tr)
+    }
+
+    // ---- rebuilding a state whose values were dropped ----
+
+    /// The values of state `id`, rebuilt by executing the chain of actions that led to it from the initial
+    /// state it started at. Every state on the way is checked against the fingerprint the search stored for
+    /// it, so a specification whose evaluation does not repeat (Print, TLCSet, TLCGet of a statistic,
+    /// RandomElement) gives an error instead of a trace that names the wrong state.
+    fn rebuild(&self, id: usize) -> R<StateRef> {
+        let mut chain: Vec<usize> = vec![];
+        let mut i = id;
+        loop {
+            chain.push(i);
+            let p = self.parent[i];
+            if p == NO_PARENT {
+                break;
+            }
+            i = p as usize;
+        }
+        chain.reverse();
+        let root = chain[0];
+        let mut s = self.init_state_at(self.ord[root] as usize)?;
+        self.check_rebuilt(&s, root)?;
+        for &w in &chain[1..] {
+            s = self.successor_at(&s, w)?;
+        }
+        Ok(s)
+    }
+
+    /// `s` is the state with id `id`: the fingerprint of `s` is the one the search stored under that id.
+    /// (A fingerprint identifies a state, so this is the check that the rebuild reached the same state.)
+    fn check_rebuilt(&self, s: &StateRef, id: usize) -> R<()> {
+        let fp = self.fingerprint(s)?;
+        if self.fps.get(fp) == Some(id as u32) {
+            return Ok(());
+        }
+        let message = format!(
+            "The counterexample trace cannot be shown: a state whose values were dropped (to save memory) was rebuilt from the initial states and came out different from the one the search found, so it is a different state ({} instead of state {}).\nThat happens when the evaluation of the specification depends on the order of exploration, through Print, TLCSet, a statistic read with TLCGet, or RandomElement. Re-run with EVERYSTATE_RETAIN=all, which keeps the values of every state.",
+            fp, id
+        );
+        Err(Box::new(Fail::Check { status: "error", message }))
+    }
+
+    /// The `ord`-th state the initial predicate enumerates, in the enumeration order of the search.
+    fn init_state_at(&self, ord: usize) -> R<StateRef> {
+        // The enumeration runs to the end; only the wanted state is kept, so this costs one initial pass
+        // and not a second copy of the initial states.
+        let mut want: Option<StateRef> = None;
+        self.enumerate_init_each(&mut |k, s| {
+            if k == ord {
+                want = Some(s);
+            }
+            Ok(())
+        })?;
+        match want {
+            Some(s) => Ok(s),
+            None => Err(Box::new(Fail::Check {
+                status: "error",
+                message: format!("The counterexample trace cannot be shown: the initial predicate enumerates fewer than {} states.", ord + 1),
+            })),
+        }
+    }
+
+    /// The successor of `s` that became state `id`: the `ord`-th state `s` generates, checked against the
+    /// fingerprint of `id`.
+    fn successor_at(&self, s: &StateRef, id: usize) -> R<StateRef> {
+        // `ord` counts the successors `s` generates, before constraints are applied, which is what the
+        // search counted too; `flat` picks the generator it counted them with.
+        let nv = self.nvars;
+        let mut rows: Vec<Value> = vec![];
+        let mut succs: Vec<StateRef> = vec![];
+        let mut acts: Vec<u32> = vec![];
+        if self.flat {
+            self.successors_flat(s, &mut rows, &mut acts)?;
+        } else {
+            self.successors(s, &mut succs, &mut acts)?;
+        }
+        let k = self.ord[id] as usize;
+        if k >= acts.len() {
+            return Err(Box::new(Fail::Check {
+                status: "error",
+                message: format!("The counterexample trace cannot be shown: the state before state {} generates {} successors now, not {}.", id, acts.len(), k + 1),
+            }));
+        }
+        let t = if self.flat { StateData::new(rows[k * nv..(k + 1) * nv].to_vec()) } else { succs[k].clone() };
+        self.check_rebuilt(&t, id)?;
+        Ok(t)
     }
 
     pub fn eval_pred(&self, p: &Pred, s: &StateRef, t: Option<&StateRef>) -> R<bool> {
@@ -787,18 +908,28 @@ impl<'a> Checker<'a> {
 
     /// All states satisfying the initial predicate, in enumeration order (duplicates included).
     pub fn enumerate_init(&self) -> R<Vec<StateRef>> {
+        let mut found: Vec<StateRef> = vec![];
+        self.enumerate_init_each(&mut |_, s| {
+            found.push(s);
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
+    /// The states satisfying the initial predicate, in enumeration order, given one at a time to `f` with
+    /// the number of states it has seen before (`enumerate_init` when all of them are wanted).
+    fn enumerate_init_each(&self, f: &mut dyn FnMut(usize, StateRef) -> R<()>) -> R<()> {
         let ev = self.ev;
         let nv = self.nvars;
-        let mut found: Vec<StateRef> = vec![];
         let buf = StateData::blank(nv);
         ev.set_state(&buf, None);
         ev.init_mode.set(true);
         ev.prime_depth.set(0);
         ev.n_assigned.set(0);
-        fn go(ck: &Checker, preds: &[Pred], i: usize, buf: &StateRef, found: &mut Vec<StateRef>) -> R<()> {
+        fn go(ck: &Checker, preds: &[Pred], i: usize, buf: &StateRef, k: &mut usize, f: &mut dyn FnMut(usize, StateRef) -> R<()>) -> R<()> {
             if i == preds.len() {
-                for k in 0..ck.nvars {
-                    if buf.is_undef(k) {
+                for j in 0..ck.nvars {
+                    if buf.is_undef(j) {
                         let missing = ck.missing(buf);
                         let many = missing.len() > 1;
                         return Err(Box::new(Fail::Check {
@@ -812,14 +943,16 @@ impl<'a> Checker<'a> {
                         }));
                     }
                 }
-                found.push(StateData::new(buf.snapshot(ck.nvars)));
-                return Ok(());
+                let n = *k;
+                *k += 1;
+                return f(n, StateData::new(buf.snapshot(ck.nvars)));
             }
-            ck.ev.enumerate(preds[i].e, &preds[i].ctx, &mut || go(ck, preds, i + 1, buf, found))
+            ck.ev.enumerate(preds[i].e, &preds[i].ctx, &mut || go(ck, preds, i + 1, buf, k, f))
         }
-        let r = go(self, &self.model.inits, 0, &buf, &mut found);
+        let mut k = 0usize;
+        let r = go(self, &self.model.inits, 0, &buf, &mut k, f);
         ev.init_mode.set(false);
-        r.map(|_| found)
+        r
     }
 
     /// As `enumerate_init`, with a failure already turned into a result; no initial predicate gives no states.
@@ -859,12 +992,14 @@ impl<'a> Checker<'a> {
         self.set_level(1);
         // the workers may take the initial states up to one the sequential code has to look at
         #[cfg(not(target_arch = "wasm32"))]
-        let found = {
+        let skip = {
             let done = crate::par::init(self, &found, events);
             self.sync_stats();
-            found.into_iter().skip(done)
+            done
         };
-        for s in found {
+        #[cfg(target_arch = "wasm32")]
+        let skip = 0usize;
+        for (k, s) in found.into_iter().enumerate().skip(skip) {
             self.generated += 1;
             self.init_generated += 1;
             let mut unseen = true;
@@ -887,6 +1022,9 @@ impl<'a> Checker<'a> {
                         self.parent.push(NO_PARENT);
                         self.level.push(1);
                         self.act.push(-1);
+                        if self.drop_states {
+                            self.ord.push(k as u32);
+                        }
                         self.inits.push(nid as u32);
                         if self.opts.record_graph {
                             self.succ.push(vec![]);
@@ -1109,15 +1247,19 @@ impl<'a> Checker<'a> {
             rows.clear();
             let generated = if flat { self.successors_flat(&s, &mut rows, &mut succ_act) } else { self.successors(&s, &mut succs, &mut succ_act) };
             if let Err(e) = generated {
+                let trace = match self.trace_to(sid) {
+                    Ok(t) => t,
+                    Err(r) => return r,
+                };
                 return match *e {
                     Fail::Check { status, message } => {
                         let mut r = self.result(status);
                         r.message = Some(message);
-                        r.trace = Some(self.trace_to(sid));
+                        r.trace = Some(trace);
                         r.queue = (self.states.len() - self.head) as u64;
                         r
                     }
-                    ref other => self.error(self.describe_err(other, true), Some(self.trace_to(sid))),
+                    ref other => self.error(self.describe_err(other, true), Some(trace)),
                 };
             }
             let extra = ev.extra_generated.replace(0);
@@ -1125,7 +1267,11 @@ impl<'a> Checker<'a> {
             let mut fresh = 0u32;
             if flat && !succ_act.is_empty() {
                 if let Err(e) = self.parent_terms(&s, &mut pterms) {
-                    return self.error(self.describe_err(&e, true), Some(self.trace_to(sid)));
+                    let trace = match self.trace_to(sid) {
+                        Ok(t) => t,
+                        Err(r) => return r,
+                    };
+                    return self.error(self.describe_err(&e, true), Some(trace));
                 }
             }
             for i in 0..succ_act.len() {
@@ -1179,6 +1325,9 @@ impl<'a> Checker<'a> {
                                 self.parent.push(sid as u32);
                                 self.level.push(lvl + 1);
                                 self.act.push(ai as i32);
+                                if self.drop_states {
+                                    self.ord.push(i as u32);
+                                }
                                 if record {
                                     self.succ.push(vec![]);
                                     self.succ_act.push(vec![]);
@@ -1210,13 +1359,21 @@ impl<'a> Checker<'a> {
                     Ok(())
                 })();
                 if let Err(e) = step {
-                    return self.error(self.describe_err(&e, true), Some(self.trace_plus(sid, &t, ai, -1)));
+                    let trace = match self.trace_plus(sid, &t, ai, -1) {
+                        Ok(t) => t,
+                        Err(r) => return r,
+                    };
+                    return self.error(self.describe_err(&e, true), Some(trace));
                 }
                 if unseen {
                     for (ii, inv) in m.invariants.iter().enumerate() {
                         match self.eval_invariant(ii, &t) {
                             Err(e) => {
-                                let mut r = self.error(format!("Evaluating invariant {} failed.\n{}", inv.name, self.describe_err(&e, false)), Some(self.trace_plus(sid, &t, ai, id)));
+                                let trace = match self.trace_plus(sid, &t, ai, id) {
+                                    Ok(t) => t,
+                                    Err(r) => return r,
+                                };
+                                let mut r = self.error(format!("Evaluating invariant {} failed.\n{}", inv.name, self.describe_err(&e, false)), Some(trace));
                                 r.code = Some(2111);
                                 if !in_model {
                                     r.call_stack = Some(self.nested_expressions(inv, &t, None));
@@ -1229,7 +1386,10 @@ impl<'a> Checker<'a> {
                             Ok(false) => {
                                 let mut r = self.result("invariant");
                                 r.name = Some(inv.name.clone());
-                                r.trace = Some(self.trace_plus(sid, &t, ai, id));
+                                r.trace = Some(match self.trace_plus(sid, &t, ai, id) {
+                                    Ok(t) => t,
+                                    Err(r) => return r,
+                                });
                                 if in_model {
                                     r.queue = r.queue.saturating_sub(1);
                                 }
@@ -1243,12 +1403,19 @@ impl<'a> Checker<'a> {
                 for p in &m.implied_actions {
                     match self.eval_pred(p, &s, Some(&t)) {
                         Err(e) => {
-                            return self.error(format!("Evaluating action property {} failed.\n{}", p.name, self.describe_err(&e, true)), Some(self.trace_plus(sid, &t, ai, id)));
+                            let trace = match self.trace_plus(sid, &t, ai, id) {
+                                Ok(t) => t,
+                                Err(r) => return r,
+                            };
+                            return self.error(format!("Evaluating action property {} failed.\n{}", p.name, self.describe_err(&e, true)), Some(trace));
                         }
                         Ok(false) => {
                             let mut r = self.result("action-property");
                             r.name = Some(p.name.clone());
-                            r.trace = Some(self.trace_plus(sid, &t, ai, id));
+                            r.trace = Some(match self.trace_plus(sid, &t, ai, id) {
+                                Ok(t) => t,
+                                Err(r) => return r,
+                            });
                             if in_model && unseen {
                                 r.queue = r.queue.saturating_sub(1);
                             }
@@ -1261,7 +1428,10 @@ impl<'a> Checker<'a> {
             self.outdeg.push(fresh);
             if succ_act.is_empty() && self.opts.check_deadlock {
                 let mut r = self.result("deadlock");
-                r.trace = Some(self.trace_to(sid));
+                r.trace = Some(match self.trace_to(sid) {
+                    Ok(t) => t,
+                    Err(r) => return r,
+                });
                 return r;
             }
             if sid & 1023 == 0 {
@@ -1270,6 +1440,13 @@ impl<'a> Checker<'a> {
                     self.last_progress = now;
                     events.progress(self.depth, self.generated, self.states.len() as u64, (self.states.len() - self.head) as u64);
                 }
+            }
+            if self.drop_states {
+                // The successors have been generated and their invariants checked: nothing reads this
+                // state's values again except a trace, which rebuilds them from the initial states
+                // (`state_at`). The fingerprint, the parent, the level and the ordinal are kept, so the
+                // state keeps its identity and its place in the graph.
+                self.states[sid] = self.empty.clone();
             }
         }
         self.sync_stats();
