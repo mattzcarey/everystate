@@ -55,7 +55,18 @@ impl RecordV {
     }
     #[inline]
     pub fn get(&self, name: StrId) -> Option<&Value> {
-        self.names.iter().position(|n| *n == name).map(|i| &self.vals[i])
+        // `names` is sorted by string id (see the field), so a binary search finds the same index with
+        // log2(k) comparisons instead of scanning up to k of them.
+        let (mut lo, mut hi) = (0usize, self.names.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.names[mid].cmp(&name) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(&self.vals[mid]),
+            }
+        }
+        None
     }
 }
 pub struct FcnV {
