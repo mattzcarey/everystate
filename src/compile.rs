@@ -5,7 +5,8 @@
 //! identifiers are resolved to what they denote (a state variable's index, a slot of a frame, a constant),
 //! applications of definitions with value parameters are inlined, and the enumerator's work (which
 //! conjunct assigns which primed variable, which leave variables unchanged, where the branches are) is
-//! decided once instead of being rediscovered for every state. Nothing is memoised across states.
+//! decided once instead of being rediscovered for every state. Nothing is memoised across states; the
+//! invariants of one state share a memo of the definitions they have in common (`InvMemo`).
 //!
 //! The rules that keep it equal to the tree-walker:
 //! * Whatever the compiler does not handle is compiled to a *fallback*: the expression is evaluated by the
@@ -25,7 +26,7 @@ use crate::modules::{for_children, level_of, tail_fn, BFn, Builtin, Def};
 use crate::stepcache::{self as sc_, DOp, Entry, Leaf, Loc, Table, Tmpl, Write};
 use crate::value::*;
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 pub struct Cx<'a> {
@@ -394,6 +395,8 @@ fn impure0(n: N, seen: &mut HashSet<usize>) -> bool {
 // ---------- the compiler ----------
 struct Comp {
     nslots: usize,
+    /// the memo the invariants of one state share (`InvMemo`); None while an action is compiled
+    inv_memo: Option<Rc<InvMemo>>,
     /// definitions and LET definitions being inlined (recursion guard)
     stack: Vec<usize>,
     budget: i64,
@@ -651,7 +654,7 @@ fn var_of(n: N) -> Option<usize> {
 
 impl Comp {
     fn new(cache: bool, plan_id: u32) -> Comp {
-        Comp { nslots: 0, stack: vec![], budget: 20_000, unstable: false, shape: None, shape_ok: false, dshape: None, dshape_ok: false, cache, top: false, descend: false, cache_slots: vec![], top_slots: vec![], units: 0, unit_stats: vec![], plan_id }
+        Comp { nslots: 0, inv_memo: None, stack: vec![], budget: 20_000, unstable: false, shape: None, shape_ok: false, dshape: None, dshape_ok: false, cache, top: false, descend: false, cache_slots: vec![], top_slots: vec![], units: 0, unit_stats: vec![], plan_id }
     }
     /// The compiled bounds of a quantifier and the scope of its body. None when a bound has no set.
     fn bounds(&mut self, bounds: &'static [Bound], sc: &Rc<Sc>) -> Option<(Bnds, Rc<Sc>)> {
@@ -1379,6 +1382,12 @@ impl Comp {
                 Ok(v)
             });
         }
+        // A definition with no parameters that an invariant refers to is memoised for the state, so an
+        // invariant that refers to it after another one has does not evaluate its body again.
+        let memo = match &self.inv_memo {
+            Some(m) if d.params.is_empty() && args.is_empty() && crate::modules::def_level(d) <= 1 => Some((m.clone(), m.slot(id))),
+            _ => None,
+        };
         let root = Rc::new(Sc { k: ScK::Root(None), next: None });
         match self.bind_args(&d.params, args, root, sc) {
             Some((inner, clear)) => {
@@ -1386,7 +1395,27 @@ impl Comp {
                 let b = self.expr(body, &inner);
                 self.stack.pop();
                 self.keep_shape(&clear);
-                with_clear(clear, b)
+                let b = with_clear(clear, b);
+                match memo {
+                    // The body is inlined with slots of its own, which are read only inside it, so a hit
+                    // that skips the body never reads a stale one. The shape is dropped: a caller may use
+                    // it only when it evaluates the body itself.
+                    Some((memo, slot)) if !self.unstable => {
+                        self.shape = None;
+                        self.shape_ok = false;
+                        self.dshape = None;
+                        self.dshape_ok = false;
+                        Box::new(move |cx| {
+                            if let Some(v) = memo.get(slot) {
+                                return Ok(v);
+                            }
+                            let v = b(cx)?;
+                            memo.put(slot, &v);
+                            Ok(v)
+                        })
+                    }
+                    _ => b,
+                }
             }
             None => self.fallback(n, sc),
         }
@@ -2608,11 +2637,61 @@ pub struct Counters {
     /// fallback expressions evaluated inside compiled code
     pub fallbacks: Cell<u64>,
 }
+/// The definitions the invariants of one state have in common, evaluated once for that state however many
+/// invariants refer to them (`Checker::eval_invariants` runs the invariants of a state as one pass over a
+/// cleared table).
+///
+/// Only a definition with no parameters is memoised, and only while an invariant is compiled: such a
+/// definition reads nothing but the state (an invariant is compiled only when it is pure and of level at
+/// most 1, so nothing it reads is primed), and the call in one invariant is the same call as in another.
+/// A value that is not `plain` is not kept, so a value holding a closure or a LET operator — whose context
+/// belongs to the plan that built it — is never handed to another plan.
+#[derive(Default)]
+pub struct InvMemo {
+    /// the value of each memoised definition, by slot; None until it is evaluated in this state
+    slots: RefCell<Vec<Option<Value>>>,
+    /// the slot of each memoised definition, by the address of the definition
+    defs: RefCell<HashMap<usize, usize>>,
+}
+
+impl InvMemo {
+    /// The slot of a definition: the same definition gets the same slot in every invariant.
+    fn slot(&self, def: usize) -> usize {
+        let mut defs = self.defs.borrow_mut();
+        if let Some(s) = defs.get(&def) {
+            return *s;
+        }
+        let s = defs.len();
+        defs.insert(def, s);
+        self.slots.borrow_mut().push(None);
+        s
+    }
+    fn get(&self, slot: usize) -> Option<Value> {
+        self.slots.borrow().get(slot).cloned().flatten()
+    }
+    fn put(&self, slot: usize, v: &Value) {
+        if !plain(v) {
+            return;
+        }
+        if let Some(c) = self.slots.borrow_mut().get_mut(slot) {
+            *c = Some(v.clone());
+        }
+    }
+    /// Forgets every value: called when the invariant pass of a new state begins.
+    pub fn clear(&self) {
+        for c in self.slots.borrow_mut().iter_mut() {
+            *c = None;
+        }
+    }
+}
+
 pub struct Plans {
     pub actions: Vec<Option<ActPlan>>,
     pub invariants: Vec<Option<PredPlan>>,
     pub n: Counters,
     blank: StateRef,
+    /// the definitions the invariants of a state have in common
+    inv_memo: Option<Rc<InvMemo>>,
     /// the step cache, when it is on
     cache: Option<RefCell<Table>>,
     rec_on: Cell<bool>,
@@ -2680,11 +2759,14 @@ pub fn compile(model: &crate::model::Model) -> Plans {
     }
     let with_cache = cache_on;
     cache_on = false; // (invariants are not cached)
+    // the definitions the invariants of a state have in common (InvMemo)
+    let inv_memo = if model.invariants.is_empty() { None } else { Some(Rc::new(InvMemo::default())) };
     let mut invariants = vec![];
     for p in &model.invariants {
         let mut seen = HashSet::new();
         let mut c = Comp::new(cache_on, plan_id);
         plan_id += 1;
+        c.inv_memo = inv_memo.clone();
         let root = if impure(p.e, &mut seen) || level_of(p.e) > 1 { None } else { root_scope(&p.ctx, &mut c, &mut seen) };
         let (root, clear) = match root {
             Some(x) => x,
@@ -2701,6 +2783,7 @@ pub fn compile(model: &crate::model::Model) -> Plans {
         invariants,
         n: Counters::default(),
         blank: StateData::blank(model.vars.len()),
+        inv_memo,
         cache: if with_cache { Some(RefCell::new(Table::new(cache_budget()))) } else { None },
         rec_on: Cell::new(false),
         rec: RefCell::new(Rec::default()),
@@ -2733,6 +2816,13 @@ impl Plans {
             self.n.compiled.set(self.n.compiled.get() + 1);
         }
         Some(r)
+    }
+    /// Starts the invariant pass of a state: the definitions the invariants of the previous state have in
+    /// common are forgotten (see `InvMemo` and `Checker::eval_invariants`).
+    pub fn begin_invariants(&self) {
+        if let Some(m) = &self.inv_memo {
+            m.clear();
+        }
     }
     /// The value of invariant `i` in `s` (the evaluator's current state), or None for the tree-walker to decide.
     pub fn run_invariant(&self, ev: &Evaluator, i: usize, s: &StateData, nv: usize) -> Option<bool> {

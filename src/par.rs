@@ -738,10 +738,8 @@ fn expand(ck: &Checker, s: &StateRef, sb: &[u8], lvl: u32, fps: &FpSet, local: &
                 out.ent.push(Ent { fp, act: acts[i], kind: CAND, len: (out.bytes.len() - mark) as u32 });
                 if !m.invariants.is_empty() {
                     let t = StateData::new(row.to_vec());
-                    for ii in 0..m.invariants.len() {
-                        if !matches!(ck.eval_invariant(ii, &t), Ok(true)) {
-                            return Some(Event::Check);
-                        }
+                    if !matches!(ck.eval_invariants(&t), Ok(None)) {
+                        return Some(Event::Check);
                     }
                 }
             }
@@ -801,12 +799,8 @@ fn expand(ck: &Checker, s: &StateRef, sb: &[u8], lvl: u32, fps: &FpSet, local: &
                 out.ent.push(Ent { fp: word, act, kind, len: (out.bytes.len() - mark) as u32 });
             }
         }
-        if unseen {
-            for ii in 0..m.invariants.len() {
-                if !matches!(ck.eval_invariant(ii, t), Ok(true)) {
-                    return Some(Event::Check);
-                }
-            }
+        if unseen && !matches!(ck.eval_invariants(t), Ok(None)) {
+            return Some(Event::Check);
         }
         level.set(lvl as i64);
         for p in &m.implied_actions {

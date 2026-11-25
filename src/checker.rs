@@ -907,22 +907,21 @@ impl<'a> Checker<'a> {
                 return Some(self.error(self.describe_err(&e, true), one(-1)));
             }
             if unseen {
-                for inv in &m.invariants {
-                    match self.eval_pred(inv, &s, None) {
-                        Err(e) => {
-                            let mut r = self.error(format!("Evaluating invariant {} failed.\n{}", inv.name, self.describe_err(&e, true)), one(-1));
-                            r.code = Some(2111);
-                            return Some(r);
-                        }
-                        Ok(false) => {
-                            let mut r = self.result("invariant-init");
-                            r.name = Some(inv.name.clone());
-                            r.trace = one(id);
-                            r.print_summary = false;
-                            return Some(r);
-                        }
-                        Ok(true) => {}
+                match self.eval_invariants(&s) {
+                    Err((ii, e)) => {
+                        let inv = &m.invariants[ii];
+                        let mut r = self.error(format!("Evaluating invariant {} failed.\n{}", inv.name, self.describe_err(&e, true)), one(-1));
+                        r.code = Some(2111);
+                        return Some(r);
                     }
+                    Ok(Some(ii)) => {
+                        let mut r = self.result("invariant-init");
+                        r.name = Some(m.invariants[ii].name.clone());
+                        r.trace = one(id);
+                        r.print_summary = false;
+                        return Some(r);
+                    }
+                    Ok(None) => {}
                 }
                 for p in &m.implied_inits {
                     match self.eval_pred(p, &s, None) {
@@ -1024,6 +1023,24 @@ impl<'a> Checker<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Every invariant of one state, in order, as one pass sharing a memo of the definitions they have in
+    /// common (`crate::compile::InvMemo`). Both phases check their invariants here: an initial state
+    /// (`compute_init`) and a state reached by a transition (`search`). Ok(None): all hold. Ok(Some(i)):
+    /// invariant `i` is false. Err((i, e)): evaluating invariant `i` failed.
+    pub(crate) fn eval_invariants(&self, s: &StateRef) -> Result<Option<usize>, (usize, Box<Fail>)> {
+        if let Some(p) = &self.plans {
+            p.begin_invariants();
+        }
+        for i in 0..self.model.invariants.len() {
+            match self.eval_invariant(i, s) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Some(i)),
+                Err(e) => return Err((i, e)),
+            }
+        }
+        Ok(None)
     }
 
     /// An invariant in a state: compiled code when there is some and it succeeds, else the tree-walker.
@@ -1213,30 +1230,29 @@ impl<'a> Checker<'a> {
                     return self.error(self.describe_err(&e, true), Some(self.trace_plus(sid, &t, ai, -1)));
                 }
                 if unseen {
-                    for (ii, inv) in m.invariants.iter().enumerate() {
-                        match self.eval_invariant(ii, &t) {
-                            Err(e) => {
-                                let mut r = self.error(format!("Evaluating invariant {} failed.\n{}", inv.name, self.describe_err(&e, false)), Some(self.trace_plus(sid, &t, ai, id)));
-                                r.code = Some(2111);
-                                if !in_model {
-                                    r.call_stack = Some(self.nested_expressions(inv, &t, None));
-                                }
-                                if in_model {
-                                    r.queue = r.queue.saturating_sub(1); // the new state has not been enqueued yet
-                                }
-                                return r;
+                    match self.eval_invariants(&t) {
+                        Err((ii, e)) => {
+                            let inv = &m.invariants[ii];
+                            let mut r = self.error(format!("Evaluating invariant {} failed.\n{}", inv.name, self.describe_err(&e, false)), Some(self.trace_plus(sid, &t, ai, id)));
+                            r.code = Some(2111);
+                            if !in_model {
+                                r.call_stack = Some(self.nested_expressions(inv, &t, None));
                             }
-                            Ok(false) => {
-                                let mut r = self.result("invariant");
-                                r.name = Some(inv.name.clone());
-                                r.trace = Some(self.trace_plus(sid, &t, ai, id));
-                                if in_model {
-                                    r.queue = r.queue.saturating_sub(1);
-                                }
-                                return r;
+                            if in_model {
+                                r.queue = r.queue.saturating_sub(1); // the new state has not been enqueued yet
                             }
-                            Ok(true) => {}
+                            return r;
                         }
+                        Ok(Some(ii)) => {
+                            let mut r = self.result("invariant");
+                            r.name = Some(m.invariants[ii].name.clone());
+                            r.trace = Some(self.trace_plus(sid, &t, ai, id));
+                            if in_model {
+                                r.queue = r.queue.saturating_sub(1);
+                            }
+                            return r;
+                        }
+                        Ok(None) => {}
                     }
                 }
                 self.set_level(lvl);
