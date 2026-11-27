@@ -25,10 +25,12 @@ const opt = (n, d) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] :
 const RUNS = Number(opt('--runs', 3)), PARTS = opt('--parts', 'single,workers,corpus').split(','), ONLY = opt('--only', '');
 const OUT = path.resolve(opt('--out', path.join(here, 'bench/vs.jsonl')));
 const TIMEOUT = Number(opt('--timeout', 600));
+// tla-ts takes library directories and Java properties only in its "java ... tlc2.TLC" form
+const CDOT = '-Dtlc2.tool.impl.Tool.cdot=true'; // action composition, which the Examples CI enables
 const ENGINES = {
-  everystate: (w, c, s) => [path.join(here, 'target/release/everystate'), '-workers', String(w), '-config', c, s],
-  'tla-ts': (w, c, s) => ['node', TLA_TS, '-workers', String(w), '-config', c, s],
-  tlc: (w, c, s) => ['java', '-XX:+UseParallelGC', '-cp', JAR, '-DTLA-Library=' + LIB, 'tlc2.TLC', '-workers', String(w), '-config', c, s],
+  everystate: (w, c, s, x) => [path.join(here, 'target/release/everystate'), ...x, '-workers', String(w), '-config', c, s],
+  'tla-ts': (w, c, s, x) => ['node', TLA_TS, '-cp', JAR, '-DTLA-Library=' + LIB, ...x, 'tlc2.TLC', '-workers', String(w), '-config', c, s],
+  tlc: (w, c, s, x) => ['java', '-XX:+UseParallelGC', '-cp', JAR, '-DTLA-Library=' + LIB, ...x, 'tlc2.TLC', '-workers', String(w), '-config', c, s],
 };
 const ex = (c, s) => [path.join(EX, 'specifications', path.dirname(c)), path.basename(c), path.basename(s)];
 const SINGLE = [
@@ -51,14 +53,14 @@ print(json.dumps({'wall':time.time()-t,'rss':resource.getrusage(resource.RUSAGE_
 const done = new Map();
 if (fs.existsSync(OUT)) for (const l of fs.readFileSync(OUT, 'utf8').split('\n')) if (l) { const r = JSON.parse(l); done.set(r.key, r); }
 fs.mkdirSync(path.dirname(OUT), { recursive: true });
-function run(part, engine, w, dir, cfg, spec, i) {
-  const key = [part, engine, w, path.join(dir, cfg), i].join('|');
+function run(part, engine, w, dir, cfg, spec, i, extra = []) {
+  const key = [part, engine, w, path.resolve(dir, cfg), i].join('|');
   if (done.has(key)) return done.get(key);
-  const p = spawnSync('python3', ['-c', PY, String(TIMEOUT), ...ENGINES[engine](w, cfg, spec)], { cwd: dir, encoding: 'utf8', maxBuffer: 1 << 26, env: { ...process.env, JAVA_TOOL_OPTIONS: '' } });
+  const p = spawnSync('python3', ['-c', PY, String(TIMEOUT), ...ENGINES[engine](w, cfg, spec, extra)], { cwd: dir, encoding: 'utf8', maxBuffer: 1 << 26, env: { ...process.env, JAVA_TOOL_OPTIONS: '' } });
   let r; try { r = JSON.parse(p.stdout); } catch { r = { wall: 0, rss: 0, rc: -1, out: p.stderr ?? '' }; }
   const num = re => { const m = [...r.out.matchAll(re)]; return m.length ? Number(m.at(-1)[1]) : null; };
-  const rec = { key, part, engine, workers: w, model: cfg.replace('.cfg', ''), wall: r.wall, rss: r.rss, rc: r.rc, distinct: num(/(\d+) distinct states found/g), generated: num(/(\d+) states generated/g),
-    kind: r.rc === null ? 'timeout' : /Invariant .* is violated/.test(r.out) ? 'safety failure' : /Temporal properties were violated/.test(r.out) ? 'liveness failure' : /Deadlock reached/.test(r.out) ? 'deadlock failure' : /No error has been found/.test(r.out) ? 'success' : /Assumption .* is false/.test(r.out) ? 'assumption failure' : 'error' };
+  const rec = { key, part, engine, workers: w, model: path.basename(cfg, '.cfg'), wall: r.wall, rss: r.rss, rc: r.rc, distinct: num(/(\d+) distinct states found/g), generated: num(/(\d+) states generated/g),
+    kind: r.rc === null ? 'timeout' : ({ 0: 'success', 10: 'assumption failure', 11: 'deadlock failure', 12: 'safety failure', 13: 'liveness failure' }[r.rc] ?? 'error') };
   fs.appendFileSync(OUT, JSON.stringify(rec) + '\n'); done.set(key, rec);
   process.stderr.write(`${part} ${rec.model} ${engine} w${w} #${i}: ${rec.wall.toFixed(2)}s ${rec.rss.toFixed(0)}MB distinct=${rec.distinct} ${rec.kind}\n`);
   return rec;
@@ -89,14 +91,14 @@ if (PARTS.includes('corpus')) {
     for (const mod of JSON.parse(fs.readFileSync(mf, 'utf8')).modules) for (const m of mod.models) {
       if (m.mode !== 'exhaustive search' || secs(m.runtime) > 5 || m.result === 'unknown') continue;
       if (ONLY && !m.path.includes(ONLY)) continue;
-      cases.push({ dir: path.join(EX, path.dirname(m.path)), cfg: path.basename(m.path), spec: path.basename(mod.path), exp: m });
+      cases.push({ dir: EX, cfg: path.join(EX, m.path), spec: path.join(EX, mod.path), exp: m }); // run as the Examples CI does: from the root
     }
   }
   const tot = Object.fromEntries(names.map(e => [e, { t: 0, ok: 0, wrong: [], common: 0 }]));
   for (const c of cases) {
-    const rs = Object.fromEntries(names.map(e => [e, run('corpus', e, 1, c.dir, c.cfg, c.spec, 0)]));
+    const rs = Object.fromEntries(names.map(e => [e, run('corpus', e, 1, c.dir, c.cfg, c.spec, 0, [CDOT])]));
     const good = r => r.kind === c.exp.result && (c.exp.distinctStates == null || c.exp.result !== 'success' || r.distinct === c.exp.distinctStates);
-    for (const e of names) { tot[e].t += rs[e].wall; if (good(rs[e])) tot[e].ok++; else tot[e].wrong.push(`${c.cfg.replace('.cfg', '')} (${rs[e].kind}${rs[e].distinct != null ? ', ' + rs[e].distinct + ' distinct' : ''})`); }
+    for (const e of names) { tot[e].t += rs[e].wall; if (good(rs[e])) tot[e].ok++; else tot[e].wrong.push(`${path.relative(path.join(EX, 'specifications'), c.cfg).replace('.cfg', '')} (${rs[e].kind}${rs[e].distinct != null ? ', ' + rs[e].distinct + ' distinct' : ''})`); }
     if (names.every(e => good(rs[e]))) for (const e of names) tot[e].common += rs[e].wall;
   }
   console.log(`\n### tlaplus/Examples, ${cases.length} models recorded at up to 5 s (one run each, 1 worker)\n`);
