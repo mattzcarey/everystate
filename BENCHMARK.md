@@ -8,6 +8,74 @@ Engines compared, one worker each, doing the same breadth-first check of the sam
 
 All engines must report the same generated / distinct state counts (`counts agree` column).
 
+## Against tla-ts and Java TLC (2026-11-27, everystate 0.4.1)
+
+[tla-ts](https://github.com/aidenybai/tla-ts) is a TLC-compatible model checker written in TypeScript.
+This section runs everystate 0.4.1 (native binary, default settings), tla-ts 0.0.10 (the npm package,
+run by Node v22) and Java TLC 2026.11.06 (OpenJDK 21, `-XX:+UseParallelGC`) on the same models: the
+three benchmark specifications of the tla-ts repository (Commit, Philosophers, Queue), the 12 models
+of the table below, and the tlaplus/Examples models that the Examples manifests record at 5 s or less.
+
+- Wall-clock seconds of the whole process (start-up, parsing and checking), one process at a time on
+  the 4-core machine described below. Peak RSS is the largest of the runs.
+- "faster than" is the other engine's time divided by everystate's.
+- tla-ts and TLC get the same library path (the TLAPS and CommunityModules sources); everystate has
+  those modules built in. All three run with the options the Examples CI uses.
+- State counts agree on every row.
+- The 4-core machine is the limit for the worker comparison: tla-ts publishes its own multi-worker
+  figures for 8 workers on an Apple M4 Pro, which this does not reproduce. Here its times with
+  `-workers 4` are about the same as with one.
+- In the corpus table a model counts when the engine gives the result kind recorded in the manifest
+  and, for a successful check, the recorded number of distinct states. The six models tla-ts does not
+  get right in this setup end in an evaluation error or a false `ASSUME`; it was not investigated
+  whether another configuration of tla-ts would run them.
+
+### One worker (median of 3)
+
+| model | distinct | everystate s | tla-ts s | TLC s | faster than tla-ts | faster than TLC | RSS MB everystate / tla-ts / TLC | counts agree |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Commit | 282251 | 3.49 | 5.83 | 6.69 | 1.7x | 1.9x | 121 / 209 / 1042 | yes |
+| Philosophers | 128889 | 0.79 | 1.75 | 2.01 | 2.2x | 2.6x | 51 / 152 / 374 | yes |
+| Queue | 44044 | 0.08 | 0.52 | 0.89 | 6.7x | 11.6x | 23 / 127 / 164 | yes |
+| TCommit | 34 | 0.00 | 0.29 | 0.60 | 61.4x | 128.8x | 13 / 102 / 108 | yes |
+| ACP_SB_TLC | 54944 | 0.31 | 1.10 | 1.58 | 3.6x | 5.1x | 29 / 142 / 245 | yes |
+| StaleShrinkV6Wait2x | 43348 | 0.26 | 1.01 | 1.55 | 3.9x | 5.9x | 29 / 140 / 267 | yes |
+| Barriers | 29279 | 1.96 | 4.74 | 4.02 | 2.4x | 2.1x | 23 / 180 / 1030 | yes |
+| SimpleRegular | 277726 | 3.24 | 5.22 | 5.15 | 1.6x | 1.6x | 163 / 234 / 1109 | yes |
+| Paxos | 1207 | 0.72 | 4.31 | 1.81 | 6.0x | 2.5x | 53 / 136 / 360 | yes |
+| VoteProof | 6962 | 5.28 | 10.61 | 11.23 | 2.0x | 2.1x | 19 / 169 / 1242 | yes |
+| MCNanoMedium | 530587 | 13.39 | 18.52 | 18.65 | 1.4x | 1.4x | 618 / 1149 / 1339 | yes |
+| MCBakery | 655200 | 7.29 | 16.34 | 10.65 | 2.2x | 1.5x | 215 / 686 / 1333 | yes |
+| MCLamportMutex | 724274 | 10.48 | 21.57 | 14.18 | 2.1x | 1.4x | 533 / 339 / 1349 | yes |
+| MCbtree | 374727 | 10.43 | 13.41 | 30.75 | 1.3x | 2.9x | 194 / 229 / 1355 | yes |
+| GameOfLife | 65536 | 8.77 | 14.25 | 10.56 | 1.6x | 1.2x | 38 / 165 / 1247 | yes |
+
+### Four workers (median of 3)
+
+| model | distinct | everystate s | tla-ts s | TLC s | faster than tla-ts | faster than TLC | RSS MB everystate / tla-ts / TLC | counts agree |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Commit | 282251 | 1.33 | 5.47 | 4.30 | 4.1x | 3.2x | 111 / 211 / 1032 | yes |
+| SimpleRegular | 277726 | 1.52 | 5.26 | 4.10 | 3.5x | 2.7x | 152 / 237 / 1106 | yes |
+| VoteProof | 6962 | 1.69 | 10.94 | 4.37 | 6.5x | 2.6x | 47 / 178 / 1267 | yes |
+| MCNanoMedium | 530587 | 4.01 | 18.12 | 8.12 | 4.5x | 2.0x | 420 / 1149 / 1334 | yes |
+| MCBakery | 655200 | 3.97 | 11.95 | 7.83 | 3.0x | 2.0x | 366 / 302 / 1331 | yes |
+| MCLamportMutex | 724274 | 3.28 | 20.87 | 9.08 | 6.4x | 2.8x | 224 / 355 / 1356 | yes |
+| MCbtree | 374727 | 3.88 | 14.30 | 11.71 | 3.7x | 3.0x | 387 / 231 / 1367 | yes |
+| GameOfLife | 65536 | 2.46 | 13.81 | 4.29 | 5.6x | 1.7x | 71 / 166 / 1253 | yes |
+
+### tlaplus/Examples, 122 models recorded at up to 5 s (one run each, 1 worker)
+
+| engine | result and distinct count as recorded | total s, all models | total s, models all three get right |
+|---|---:|---:|---:|
+| everystate | 122 of 122 | 43.1 | 36.1 |
+| tla-ts | 116 of 122 | 151.1 | 148.6 |
+| tlc | 122 of 122 | 179.6 | 156.5 |
+
+tla-ts differs on: FiniteMonotonic/MCCRDT (assumption failure); FiniteMonotonic/MCReplicatedLog (assumption failure); TLC/TestGraphs (error); YoYo/YoYoAllGraphs (error, 0 distinct); ewd998/EWD998ChanTrace (assumption failure); glowingRaccoon/product (error)
+
+Reproduce with `node scripts/bench-vs.mjs --runs 3` (the paths are environment variables at the top of
+the script); the raw runs are in `bench/vs.jsonl`.
+
 ## Result (2026-11-18, version 0.4.0)
 
 Median wall-clock seconds of 3 runs of the whole process (start-up, parsing and checking), one worker

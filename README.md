@@ -235,8 +235,28 @@ Real TLC is the reference (details in [CONFORMANCE.md](CONFORMANCE.md)):
 - TLC's own `test-model` suite, run side by side with `tla2tools.jar`: 383 of 414 match.
 - pstack `statechart` corpus: 33 of 33 outputs byte-identical.
 
-Faster than single-worker Java TLC on all 12 benchmark models (1.3x to 5.7x), with near-instant
-start-up: [BENCHMARK.md](BENCHMARK.md).
+## Speed
+
+Wall-clock seconds for the whole process on a 4-core Linux machine, median of 3, against Java TLC
+and [tla-ts](https://github.com/aidenybai/tla-ts) 0.0.10 (run by Node). The first three models are
+tla-ts's own benchmarks. All three checkers report the same state counts.
+
+| Model | Distinct states | everystate | tla-ts | TLC |
+|---|---:|---:|---:|---:|
+| Commit | 282,251 | 3.49 | 5.83 | 6.69 |
+| Philosophers | 128,889 | 0.79 | 1.75 | 2.01 |
+| Queue | 44,044 | 0.08 | 0.52 | 0.89 |
+| Paxos | 1,207 | 0.72 | 4.31 | 1.81 |
+| MCBakery | 655,200 | 7.29 | 16.34 | 10.65 |
+| MCLamportMutex | 724,274 | 10.48 | 21.57 | 14.18 |
+| MCbtree | 374,727 | 10.43 | 13.41 | 30.75 |
+| MCLamportMutex, 4 workers | 724,274 | 3.28 | 20.87 | 9.08 |
+| MCbtree, 4 workers | 374,727 | 3.88 | 14.30 | 11.71 |
+| 122 tlaplus/Examples models | | 43.1 | 151.1 | 179.6 |
+
+With one worker everystate is 1.3x to 6.7x faster than tla-ts and 1.2x to 11.6x faster than TLC on
+the 14 models that run long enough to measure, and uses less memory than TLC on all of them. All 15
+models, four-worker results, memory and the method are in [BENCHMARK.md](BENCHMARK.md).
 
 ## Not supported
 
